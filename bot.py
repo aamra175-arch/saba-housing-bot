@@ -7,6 +7,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 import requests
 import json
+import base64
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -15,6 +16,7 @@ TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 SHEET_ID = os.environ.get('SHEET_ID')
 TRANSFER_NUMBER = os.environ.get('TRANSFER_NUMBER', '01152596770')
 GOOGLE_CREDENTIALS = os.environ.get('GOOGLE_CREDENTIALS')
+ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY')
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
@@ -24,6 +26,90 @@ def get_sheet():
     creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     client = gspread.authorize(creds)
     return client.open_by_key(SHEET_ID)
+
+def verify_receipt(photo_file_id, expected_amount=None):
+    try:
+        # تحميل الصورة من تيليجرام
+        file_info = bot.get_file(photo_file_id)
+        file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_info.file_path}"
+        img_response = requests.get(file_url)
+        img_base64 = base64.b64encode(img_response.content).decode('utf-8')
+
+        # التحقق بـ Claude
+        prompt = f"""أنت مساعد للتحقق من إيصالات الدفع.
+
+افحص هذه الصورة وأجب بـ JSON فقط بهذا الشكل:
+{{
+  "is_receipt": true/false,
+  "transfer_number_found": true/false,
+  "amount": "المبلغ الموجود في الإيصال أو null",
+  "reason": "سبب الرفض إن وجد"
+}}
+
+رقم التحويل المطلوب: {TRANSFER_NUMBER}
+المبلغ المتوقع: {expected_amount if expected_amount else 'غير محدد'}
+
+تحقق من:
+1. هل الصورة إيصال دفع حقيقي (انستاباي أو كاش)؟
+2. هل يحتوي على رقم {TRANSFER_NUMBER}؟ (للانستاباي فقط)
+3. ما هو المبلغ الموجود في الإيصال؟"""
+
+        response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json"
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 300,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": img_base64
+                            }
+                        },
+                        {
+                            "type": "text",
+                            "text": prompt
+                        }
+                    ]
+                }]
+            }
+        )
+
+        result = response.json()
+        text = result['content'][0]['text']
+        # استخراج JSON
+        json_match = re.search(r'\{.*\}', text, re.DOTALL)
+        if json_match:
+            data = json.loads(json_match.group())
+            return data
+        return None
+    except Exception as e:
+        logger.error(f"Error verifying receipt: {e}")
+        return None
+
+def check_duplicate_receipt(amount, date):
+    try:
+        spreadsheet = get_sheet()
+        try:
+            log_ws = spreadsheet.worksheet('سجل المدفوعات')
+            data = log_ws.get_all_values()
+            for row in data[1:]:
+                if len(row) >= 7 and row[0] == date and str(row[6]) == str(amount):
+                    return True
+        except:
+            pass
+        return False
+    except:
+        return False
 
 def find_student(name):
     try:
@@ -53,8 +139,7 @@ def record_payment(student, amount, pay_type, date, time_str):
     try:
         spreadsheet = get_sheet()
         ws = spreadsheet.worksheet(student['sheet'])
-        
-        # حساب الفرق
+
         try:
             rent = float(str(student['rent']).replace(',', ''))
             paid = float(str(amount).replace(',', ''))
@@ -64,18 +149,16 @@ def record_payment(student, amount, pay_type, date, time_str):
             paid = 0
             diff = 0
 
-        # تحديث الشيت الرئيسي
         ws.update_cell(student['row'], 5, paid)
         ws.update_cell(student['row'], 6, diff if diff > 0 else 0)
         ws.update_cell(student['row'], 7, '✅ دفع كامل' if diff <= 0 else f'⚠️ دفع جزئي - متبقي {diff:.0f}')
 
-        # سجل المدفوعات
         try:
             log_ws = spreadsheet.worksheet('سجل المدفوعات')
         except:
             log_ws = spreadsheet.add_worksheet('سجل المدفوعات', 1000, 10)
             log_ws.append_row(['التاريخ', 'الوقت', 'الاسم', 'العمارة', 'الوحدة', 'الإيجار', 'المبلغ المدفوع', 'الفرق', 'نوع الدفع'])
-        
+
         log_ws.append_row([date, time_str, student['name'], student['sheet'], student['unit'], rent, paid, diff if diff > 0 else 0, pay_type])
         return True, diff
     except Exception as e:
@@ -144,7 +227,7 @@ def handle_text(message):
 
         success, diff = record_payment(student, amount, pay_type, date, time_str)
         if success:
-            diff_text = f"✅ دفع كامل" if diff <= 0 else f"⚠️ متبقي: {diff:.0f} جنيه"
+            diff_text = "✅ دفع كامل" if diff <= 0 else f"⚠️ متبقي: {diff:.0f} جنيه"
             bot.reply_to(message,
                 f"✅ تم تسجيل الدفع!\n\n"
                 f"👤 {student['name']}\n"
@@ -180,9 +263,41 @@ def handle_photo(message):
     if chat_id not in user_states or user_states[chat_id].get('step') != 'waiting_photo':
         bot.reply_to(message, "⚠️ ابعت اسم الطالب الأول")
         return
+
+    bot.reply_to(message, "⏳ بتحقق من الإيصال...")
+
+    photo_file_id = message.photo[-1].file_id
+    student = user_states[chat_id]['student']
+
+    result = verify_receipt(photo_file_id)
+
+    if result is None:
+        bot.reply_to(message, "⚠️ مقدرتش أتحقق من الإيصال، حاول تاني")
+        return
+
+    if not result.get('is_receipt'):
+        bot.reply_to(message, f"❌ الصورة دي مش إيصال دفع\n{result.get('reason', '')}")
+        return
+
+    # التحقق من رقم التحويل للانستاباي
+    receipt_amount = result.get('amount')
+    if receipt_amount and not result.get('transfer_number_found') and 'كاش' not in str(receipt_amount):
+        bot.reply_to(message, f"❌ الإيصال مش بيحتوي على رقم التحويل {TRANSFER_NUMBER}")
+        return
+
+    # التحقق من تكرار الإيصال
+    now = datetime.now()
+    date = now.strftime('%Y-%m-%d')
+    if receipt_amount and check_duplicate_receipt(receipt_amount, date):
+        bot.reply_to(message, "❌ الإيصال ده اتسجل قبل كده!")
+        return
+
     user_states[chat_id]['step'] = 'waiting_amount'
-    user_states[chat_id]['photo'] = message.photo[-1].file_id
-    bot.reply_to(message, "✅ استلمت الإيصال!\n\n💰 ادخل المبلغ المدفوع:\nمثال: 1500")
+    user_states[chat_id]['photo'] = photo_file_id
+    user_states[chat_id]['receipt_amount'] = receipt_amount
+
+    amount_hint = f"\n💡 المبلغ في الإيصال: {receipt_amount} جنيه" if receipt_amount else ""
+    bot.reply_to(message, f"✅ الإيصال تمام!{amount_hint}\n\n💰 ادخل المبلغ المدفوع:\nمثال: 1500")
 
 if __name__ == '__main__':
     logger.info("Bot started...")
