@@ -34,7 +34,7 @@ def find_student(name):
                 ws = spreadsheet.worksheet(sheet_name)
                 data = ws.get_all_values()
                 for i, row in enumerate(data):
-                    if len(row) >= 2 and name.strip() in row[1].strip():
+                    if if len(row) >= 2 and name.strip().lower() in row[1].strip().lower():
                         return {
                             'sheet': sheet_name,
                             'row': i + 1,
