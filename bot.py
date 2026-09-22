@@ -53,17 +53,34 @@ def record_payment(student, amount, pay_type, date, time_str):
     try:
         spreadsheet = get_sheet()
         ws = spreadsheet.worksheet(student['sheet'])
-        ws.update_cell(student['row'], 5, '✅ دفع')
+        
+        # حساب الفرق
+        try:
+            rent = float(str(student['rent']).replace(',', ''))
+            paid = float(str(amount).replace(',', ''))
+            diff = rent - paid
+        except:
+            rent = 0
+            paid = 0
+            diff = 0
+
+        # تحديث الشيت الرئيسي
+        ws.update_cell(student['row'], 5, paid)
+        ws.update_cell(student['row'], 6, diff if diff > 0 else 0)
+        ws.update_cell(student['row'], 7, '✅ دفع كامل' if diff <= 0 else f'⚠️ دفع جزئي - متبقي {diff:.0f}')
+
+        # سجل المدفوعات
         try:
             log_ws = spreadsheet.worksheet('سجل المدفوعات')
         except:
             log_ws = spreadsheet.add_worksheet('سجل المدفوعات', 1000, 10)
-            log_ws.append_row(['التاريخ', 'الوقت', 'الاسم', 'العمارة', 'الوحدة', 'المبلغ', 'نوع الدفع'])
-        log_ws.append_row([date, time_str, student['name'], student['sheet'], student['unit'], amount, pay_type])
-        return True
+            log_ws.append_row(['التاريخ', 'الوقت', 'الاسم', 'العمارة', 'الوحدة', 'الإيجار', 'المبلغ المدفوع', 'الفرق', 'نوع الدفع'])
+        
+        log_ws.append_row([date, time_str, student['name'], student['sheet'], student['unit'], rent, paid, diff if diff > 0 else 0, pay_type])
+        return True, diff
     except Exception as e:
         logger.error(f"Error: {e}")
-        return False
+        return False, 0
 
 def check_duplicate(name, date):
     try:
@@ -87,8 +104,10 @@ def start(message):
     bot.reply_to(message,
         "👋 أهلاً في بوت سبا للإيجارات!\n\n"
         "📌 طريقة الاستخدام:\n"
-        "1️⃣ اكتب اسم الطالب الرباعي\n"
-        "2️⃣ بعدين ابعت صورة الإيصال مع المبلغ ونوع الدفع\n\n"
+        "1️⃣ اكتب اسم الطالب\n"
+        "2️⃣ ابعت صورة الإيصال\n"
+        "3️⃣ ابعت المبلغ\n"
+        "4️⃣ ابعت نوع الدفع\n\n"
         "ابدأ بكتابة اسم الطالب 👇"
     )
 
@@ -97,29 +116,42 @@ def handle_text(message):
     chat_id = message.chat.id
     text = message.text.strip()
 
-    if chat_id in user_states and user_states[chat_id].get('step') == 'waiting_details':
-        parts = text.split(',')
-        if len(parts) < 2:
-            bot.reply_to(message, "⚠️ ابعت المبلغ ونوع الدفع بالشكل ده:\nمثال: 1500, انستاباي")
+    # انتظار المبلغ
+    if chat_id in user_states and user_states[chat_id].get('step') == 'waiting_amount':
+        try:
+            float(text.replace(',', ''))
+        except:
+            bot.reply_to(message, "⚠️ ادخل المبلغ كرقم فقط\nمثال: 1500")
             return
-        amount = parts[0].strip()
-        pay_type = parts[1].strip()
+        user_states[chat_id]['amount'] = text
+        user_states[chat_id]['step'] = 'waiting_pay_type'
+        bot.reply_to(message, "💳 ادخل نوع الدفع:\nمثال: انستاباي / كاش / تحويل بنكي")
+        return
+
+    # انتظار نوع الدفع
+    if chat_id in user_states and user_states[chat_id].get('step') == 'waiting_pay_type':
+        pay_type = text
+        amount = user_states[chat_id]['amount']
         student = user_states[chat_id]['student']
         now = datetime.now()
         date = now.strftime('%Y-%m-%d')
         time_str = now.strftime('%H:%M')
+
         if check_duplicate(student['name'], date):
             bot.reply_to(message, f"⚠️ {student['name']} دفع النهاردة قبل كده!")
             del user_states[chat_id]
             return
-        success = record_payment(student, amount, pay_type, date, time_str)
+
+        success, diff = record_payment(student, amount, pay_type, date, time_str)
         if success:
+            diff_text = f"✅ دفع كامل" if diff <= 0 else f"⚠️ متبقي: {diff:.0f} جنيه"
             bot.reply_to(message,
                 f"✅ تم تسجيل الدفع!\n\n"
                 f"👤 {student['name']}\n"
                 f"🏢 {student['sheet']}\n"
-                f"💰 {amount} جنيه\n"
+                f"💰 المدفوع: {amount} جنيه\n"
                 f"💳 {pay_type}\n"
+                f"📊 {diff_text}\n"
                 f"📅 {date} - {time_str}"
             )
         else:
@@ -127,6 +159,7 @@ def handle_text(message):
         del user_states[chat_id]
         return
 
+    # البحث عن الطالب
     student = find_student(text)
     if student:
         user_states[chat_id] = {'student': student, 'step': 'waiting_photo'}
@@ -135,7 +168,7 @@ def handle_text(message):
             f"👤 {student['name']}\n"
             f"🏢 {student['sheet']}\n"
             f"🚪 {student['unit']}\n"
-            f"💰 {student['rent']} جنيه\n\n"
+            f"💰 الإيجار: {student['rent']} جنيه\n\n"
             f"📸 ابعت صورة الإيصال"
         )
     else:
@@ -147,15 +180,9 @@ def handle_photo(message):
     if chat_id not in user_states or user_states[chat_id].get('step') != 'waiting_photo':
         bot.reply_to(message, "⚠️ ابعت اسم الطالب الأول")
         return
-    user_states[chat_id]['step'] = 'waiting_details'
+    user_states[chat_id]['step'] = 'waiting_amount'
     user_states[chat_id]['photo'] = message.photo[-1].file_id
-    bot.reply_to(message,
-        "✅ استلمت الإيصال!\n\n"
-        "دلوقتي ابعت المبلغ ونوع الدفع:\n"
-        "مثال: 1500, انستاباي\n"
-        "أو: 1500, كاش\n"
-        "أو: 1500, تحويل بنكي"
-    )
+    bot.reply_to(message, "✅ استلمت الإيصال!\n\n💰 ادخل المبلغ المدفوع:\nمثال: 1500")
 
 if __name__ == '__main__':
     logger.info("Bot started...")
