@@ -30,9 +30,18 @@ def get_sheet():
 def verify_receipt(photo_file_id):
     try:
         file_info = bot.get_file(photo_file_id)
-        file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_info.file_path}"
+        file_path = file_info.file_path
+        file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
         img_response = requests.get(file_url)
         img_base64 = base64.b64encode(img_response.content).decode('utf-8')
+
+        # تحديد نوع الصورة تلقائياً
+        if file_path.lower().endswith('.png'):
+            mime_type = 'image/png'
+        elif file_path.lower().endswith('.webp'):
+            mime_type = 'image/webp'
+        else:
+            mime_type = 'image/jpeg'
 
         prompt = f"""أنت مساعد للتحقق من إيصالات الدفع.
 افحص هذه الصورة وأجب بـ JSON فقط بهذا الشكل بدون أي نص إضافي:
@@ -41,9 +50,9 @@ def verify_receipt(photo_file_id):
 رقم التحويل المطلوب: {TRANSFER_NUMBER}
 
 تحقق من:
-1. هل الصورة إيصال دفع حقيقي (انستاباي أو كاش)؟
-2. هل يحتوي على رقم {TRANSFER_NUMBER}؟ (للانستاباي فقط - للكاش اجعل transfer_number_found = true تلقائياً)
-3. ما هو المبلغ الموجود في الإيصال؟"""
+1. هل الصورة إيصال دفع حقيقي (انستاباي أو كاش أو تحويل بنكي أو screenshot لتحويل)؟
+2. هل يحتوي على رقم {TRANSFER_NUMBER}؟ (للانستاباي والتحويل فقط - للكاش اجعل transfer_number_found = true تلقائياً)
+3. ما هو المبلغ الموجود في الإيصال بالأرقام فقط؟"""
 
         response = requests.post(
             f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}",
@@ -53,7 +62,7 @@ def verify_receipt(photo_file_id):
                     "parts": [
                         {
                             "inline_data": {
-                                "mime_type": "image/jpeg",
+                                "mime_type": mime_type,
                                 "data": img_base64
                             }
                         },
@@ -68,6 +77,12 @@ def verify_receipt(photo_file_id):
         )
 
         result = response.json()
+        logger.info(f"Gemini response: {result}")
+
+        if 'candidates' not in result:
+            logger.error(f"Gemini error: {result}")
+            return None
+
         text = result['candidates'][0]['content']['parts'][0]['text']
         json_match = re.search(r'\{.*\}', text, re.DOTALL)
         if json_match:
@@ -246,7 +261,6 @@ def handle_photo(message):
     bot.reply_to(message, "⏳ بتحقق من الإيصال...")
 
     photo_file_id = message.photo[-1].file_id
-
     result = verify_receipt(photo_file_id)
 
     if result is None:
