@@ -43,7 +43,7 @@ def verify_receipt(photo_file_id):
             mime_type = 'image/jpeg'
 
         prompt = f"""أنت مساعد للتحقق من إيصالات الدفع.
-افحص هذه الصورة وأجب بـ JSON فقط بهذا الشكل بدون أي نص إضافي:
+افحص هذه الصورة وأجب بـ JSON فقط بهذا الشكل بدون أي نص إضافي ولا markdown:
 {{"is_receipt": true, "transfer_number_found": true, "amount": "المبلغ", "reason": ""}}
 
 رقم التحويل المطلوب: {TRANSFER_NUMBER}
@@ -51,7 +51,9 @@ def verify_receipt(photo_file_id):
 تحقق من:
 1. هل الصورة إيصال دفع حقيقي (انستاباي أو كاش أو تحويل بنكي أو screenshot لتحويل)؟
 2. هل يحتوي على رقم {TRANSFER_NUMBER}؟ (للانستاباي والتحويل فقط - للكاش اجعل transfer_number_found = true تلقائياً)
-3. ما هو المبلغ الموجود في الإيصال بالأرقام فقط؟"""
+3. ما هو المبلغ الموجود في الإيصال بالأرقام فقط؟
+
+مهم: أجب بـ JSON فقط بدون أي كلام تاني أو ```json"""
 
         response = requests.post(
             f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key={GEMINI_API_KEY}",
@@ -70,7 +72,10 @@ def verify_receipt(photo_file_id):
                 }],
                 "generationConfig": {
                     "temperature": 0,
-                    "maxOutputTokens": 200
+                    "maxOutputTokens": 1000,
+                    "thinkingConfig": {
+                        "thinkingBudget": 0
+                    }
                 }
             }
         )
@@ -83,6 +88,8 @@ def verify_receipt(photo_file_id):
             return None
 
         text = result['candidates'][0]['content']['parts'][0]['text']
+        # تنظيف الرد
+        text = text.strip().replace('```json', '').replace('```', '').strip()
         json_match = re.search(r'\{.*\}', text, re.DOTALL)
         if json_match:
             data = json.loads(json_match.group())
