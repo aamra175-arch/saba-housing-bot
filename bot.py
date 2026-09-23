@@ -16,7 +16,7 @@ TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 SHEET_ID = os.environ.get('SHEET_ID')
 TRANSFER_NUMBER = os.environ.get('TRANSFER_NUMBER', '01152596770')
 GOOGLE_CREDENTIALS = os.environ.get('GOOGLE_CREDENTIALS')
-ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY')
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
@@ -27,66 +27,48 @@ def get_sheet():
     client = gspread.authorize(creds)
     return client.open_by_key(SHEET_ID)
 
-def verify_receipt(photo_file_id, expected_amount=None):
+def verify_receipt(photo_file_id):
     try:
-        # تحميل الصورة من تيليجرام
         file_info = bot.get_file(photo_file_id)
         file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_info.file_path}"
         img_response = requests.get(file_url)
         img_base64 = base64.b64encode(img_response.content).decode('utf-8')
 
-        # التحقق بـ Claude
         prompt = f"""أنت مساعد للتحقق من إيصالات الدفع.
-
-افحص هذه الصورة وأجب بـ JSON فقط بهذا الشكل:
-{{
-  "is_receipt": true/false,
-  "transfer_number_found": true/false,
-  "amount": "المبلغ الموجود في الإيصال أو null",
-  "reason": "سبب الرفض إن وجد"
-}}
+افحص هذه الصورة وأجب بـ JSON فقط بهذا الشكل بدون أي نص إضافي:
+{{"is_receipt": true, "transfer_number_found": true, "amount": "المبلغ", "reason": ""}}
 
 رقم التحويل المطلوب: {TRANSFER_NUMBER}
-المبلغ المتوقع: {expected_amount if expected_amount else 'غير محدد'}
 
 تحقق من:
 1. هل الصورة إيصال دفع حقيقي (انستاباي أو كاش)؟
-2. هل يحتوي على رقم {TRANSFER_NUMBER}؟ (للانستاباي فقط)
+2. هل يحتوي على رقم {TRANSFER_NUMBER}؟ (للانستاباي فقط - للكاش اجعل transfer_number_found = true تلقائياً)
 3. ما هو المبلغ الموجود في الإيصال؟"""
 
         response = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json"
-            },
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}",
+            headers={"Content-Type": "application/json"},
             json={
-                "model": "claude-haiku-4-5-20251001",
-                "max_tokens": 300,
-                "messages": [{
-                    "role": "user",
-                    "content": [
+                "contents": [{
+                    "parts": [
                         {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/jpeg",
+                            "inline_data": {
+                                "mime_type": "image/jpeg",
                                 "data": img_base64
                             }
                         },
-                        {
-                            "type": "text",
-                            "text": prompt
-                        }
+                        {"text": prompt}
                     ]
-                }]
+                }],
+                "generationConfig": {
+                    "temperature": 0,
+                    "maxOutputTokens": 200
+                }
             }
         )
 
         result = response.json()
-        text = result['content'][0]['text']
-        # استخراج JSON
+        text = result['candidates'][0]['content']['parts'][0]['text']
         json_match = re.search(r'\{.*\}', text, re.DOTALL)
         if json_match:
             data = json.loads(json_match.group())
@@ -199,7 +181,6 @@ def handle_text(message):
     chat_id = message.chat.id
     text = message.text.strip()
 
-    # انتظار المبلغ
     if chat_id in user_states and user_states[chat_id].get('step') == 'waiting_amount':
         try:
             float(text.replace(',', ''))
@@ -211,7 +192,6 @@ def handle_text(message):
         bot.reply_to(message, "💳 ادخل نوع الدفع:\nمثال: انستاباي / كاش / تحويل بنكي")
         return
 
-    # انتظار نوع الدفع
     if chat_id in user_states and user_states[chat_id].get('step') == 'waiting_pay_type':
         pay_type = text
         amount = user_states[chat_id]['amount']
@@ -242,7 +222,6 @@ def handle_text(message):
         del user_states[chat_id]
         return
 
-    # البحث عن الطالب
     student = find_student(text)
     if student:
         user_states[chat_id] = {'student': student, 'step': 'waiting_photo'}
@@ -267,7 +246,6 @@ def handle_photo(message):
     bot.reply_to(message, "⏳ بتحقق من الإيصال...")
 
     photo_file_id = message.photo[-1].file_id
-    student = user_states[chat_id]['student']
 
     result = verify_receipt(photo_file_id)
 
@@ -279,13 +257,11 @@ def handle_photo(message):
         bot.reply_to(message, f"❌ الصورة دي مش إيصال دفع\n{result.get('reason', '')}")
         return
 
-    # التحقق من رقم التحويل للانستاباي
-    receipt_amount = result.get('amount')
-    if receipt_amount and not result.get('transfer_number_found') and 'كاش' not in str(receipt_amount):
+    if not result.get('transfer_number_found'):
         bot.reply_to(message, f"❌ الإيصال مش بيحتوي على رقم التحويل {TRANSFER_NUMBER}")
         return
 
-    # التحقق من تكرار الإيصال
+    receipt_amount = result.get('amount')
     now = datetime.now()
     date = now.strftime('%Y-%m-%d')
     if receipt_amount and check_duplicate_receipt(receipt_amount, date):
