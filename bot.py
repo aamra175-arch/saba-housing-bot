@@ -35,7 +35,6 @@ def verify_receipt(photo_file_id):
         img_response = requests.get(file_url)
         img_base64 = base64.b64encode(img_response.content).decode('utf-8')
 
-        # تحديد نوع الصورة تلقائياً
         if file_path.lower().endswith('.png'):
             mime_type = 'image/png'
         elif file_path.lower().endswith('.webp'):
@@ -55,7 +54,7 @@ def verify_receipt(photo_file_id):
 3. ما هو المبلغ الموجود في الإيصال بالأرقام فقط؟"""
 
         response = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}",
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}",
             headers={"Content-Type": "application/json"},
             json={
                 "contents": [{
