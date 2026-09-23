@@ -18,6 +18,10 @@ TRANSFER_NUMBER = os.environ.get('TRANSFER_NUMBER', '01152596770')
 GOOGLE_CREDENTIALS = os.environ.get('GOOGLE_CREDENTIALS')
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 
+RECIPIENT_NAME_AR = 'يوسف منصور'
+RECIPIENT_NAME_EN = 'yousef mansour'
+RECIPIENT_INITIALS = ['y', 'm', 'a', 'm']
+
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
 def get_sheet():
@@ -44,17 +48,20 @@ def verify_receipt(photo_file_id):
 
         prompt = f"""أنت مساعد للتحقق من إيصالات الدفع.
 افحص هذه الصورة وأجب بـ JSON فقط بهذا الشكل بدون أي نص إضافي ولا markdown:
-{{"is_receipt": true, "transfer_number_found": true, "amount": "المبلغ بالأرقام فقط", "reason": ""}}
-
-رقم التحويل المطلوب: {TRANSFER_NUMBER}
+{{"is_receipt": true, "recipient_verified": true, "amount": "المبلغ بالأرقام فقط", "reason": ""}}
 
 تحقق من:
-1. هل الصورة إيصال دفع حقيقي (انستاباي أو كاش أو تحويل بنكي أو screenshot لتحويل)؟
-2. هل يحتوي على رقم {TRANSFER_NUMBER}؟ (للانستاباي والتحويل فقط - للكاش اجعل transfer_number_found = true تلقائياً)
-3. ما هو المبلغ الموجود في الإيصال بالأرقام فقط بدون كلمة جنيه؟ - مهم جداً لازم تقرأ المبلغ
+1. هل الصورة إيصال دفع حقيقي؟ مقبول: انستاباي، كاش، تحويل بنكي، SMS تحويل، صورة رسالة تحويل بنكي.
+2. تحقق من اسم المستلم - مقبول أي من التالي:
+   - رقم انستاباي: {TRANSFER_NUMBER}
+   - اسم عربي يحتوي على: {RECIPIENT_NAME_AR}
+   - اسم إنجليزي يبدأ بـ: y m a m (مع نجوم بين الحروف مثل: yousef m******* a** m***)
+   - إذا الاسم مخفي جزئياً بنجوم (*) تحقق أن أول حرف من كل جزء هو: y ثم m ثم a ثم m
+   - للكاش: recipient_verified = true تلقائياً
+3. اقرأ المبلغ بالأرقام فقط بدون كلمة جنيه أو EGP.
 
-إذا مش قادر تقرأ أي معلومة من دي اجعل is_receipt = false واكتب السبب في reason.
-أجب بـ JSON فقط بدون أي كلام تاني."""
+إذا مش قادر تتحقق من أي معلومة اجعل is_receipt = false واكتب السبب في reason.
+أجب بـ JSON فقط."""
 
         response = requests.post(
             f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key={GEMINI_API_KEY}",
@@ -153,8 +160,14 @@ def record_payment(student, amount, pay_type, date, time_str):
             diff = 0
 
         ws.update_cell(student['row'], 5, paid)
-        ws.update_cell(student['row'], 6, diff if diff > 0 else 0)
-        ws.update_cell(student['row'], 7, '✅ دفع كامل' if diff <= 0 else f'⚠️ دفع جزئي - متبقي {diff:.0f}')
+        ws.update_cell(student['row'], 6, round(diff, 2))
+        if diff > 0:
+            status = f'⚠️ دفع جزئي - متبقي {diff:.0f}'
+        elif diff < 0:
+            status = f'✅ دفع كامل + زيادة {abs(diff):.0f}'
+        else:
+            status = '✅ دفع كامل'
+        ws.update_cell(student['row'], 7, status)
 
         try:
             log_ws = spreadsheet.worksheet('سجل المدفوعات')
@@ -162,7 +175,7 @@ def record_payment(student, amount, pay_type, date, time_str):
             log_ws = spreadsheet.add_worksheet('سجل المدفوعات', 1000, 10)
             log_ws.append_row(['التاريخ', 'الوقت', 'الاسم', 'العمارة', 'الوحدة', 'الإيجار', 'المبلغ المدفوع', 'الفرق', 'نوع الدفع'])
 
-        log_ws.append_row([date, time_str, student['name'], student['sheet'], student['unit'], rent, paid, diff if diff > 0 else 0, pay_type])
+        log_ws.append_row([date, time_str, student['name'], student['sheet'], student['unit'], rent, paid, round(diff, 2), pay_type])
         return True, diff
     except Exception as e:
         logger.error(f"Error: {e}")
@@ -216,7 +229,12 @@ def handle_text(message):
 
         success, diff = record_payment(student, amount, pay_type, date, time_str)
         if success:
-            diff_text = "✅ دفع كامل" if diff <= 0 else f"⚠️ متبقي: {diff:.0f} جنيه"
+            if diff > 0:
+                diff_text = f"⚠️ متبقي: {diff:.0f} جنيه"
+            elif diff < 0:
+                diff_text = f"✅ دفع كامل + زيادة {abs(diff):.0f} جنيه"
+            else:
+                diff_text = "✅ دفع كامل"
             bot.reply_to(message,
                 f"✅ تم تسجيل الدفع!\n\n"
                 f"👤 {student['name']}\n"
@@ -265,8 +283,8 @@ def handle_photo(message):
         bot.reply_to(message, f"❌ الإيصال مرفوض\n{result.get('reason', 'الصورة مش إيصال دفع')}")
         return
 
-    if not result.get('transfer_number_found'):
-        bot.reply_to(message, f"❌ الإيصال مش بيحتوي على رقم التحويل {TRANSFER_NUMBER}")
+    if not result.get('recipient_verified'):
+        bot.reply_to(message, f"❌ الإيصال مش بيحتوي على اسم أو رقم المستلم الصح")
         return
 
     receipt_amount = result.get('amount')
