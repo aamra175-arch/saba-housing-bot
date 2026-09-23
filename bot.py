@@ -44,16 +44,17 @@ def verify_receipt(photo_file_id):
 
         prompt = f"""أنت مساعد للتحقق من إيصالات الدفع.
 افحص هذه الصورة وأجب بـ JSON فقط بهذا الشكل بدون أي نص إضافي ولا markdown:
-{{"is_receipt": true, "transfer_number_found": true, "amount": "المبلغ", "reason": ""}}
+{{"is_receipt": true, "transfer_number_found": true, "amount": "المبلغ بالأرقام فقط", "reason": ""}}
 
 رقم التحويل المطلوب: {TRANSFER_NUMBER}
 
 تحقق من:
 1. هل الصورة إيصال دفع حقيقي (انستاباي أو كاش أو تحويل بنكي أو screenshot لتحويل)؟
 2. هل يحتوي على رقم {TRANSFER_NUMBER}؟ (للانستاباي والتحويل فقط - للكاش اجعل transfer_number_found = true تلقائياً)
-3. ما هو المبلغ الموجود في الإيصال بالأرقام فقط؟
+3. ما هو المبلغ الموجود في الإيصال بالأرقام فقط بدون كلمة جنيه؟ - مهم جداً لازم تقرأ المبلغ
 
-مهم: أجب بـ JSON فقط بدون أي كلام تاني أو ```json"""
+إذا مش قادر تقرأ أي معلومة من دي اجعل is_receipt = false واكتب السبب في reason.
+أجب بـ JSON فقط بدون أي كلام تاني."""
 
         response = requests.post(
             f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key={GEMINI_API_KEY}",
@@ -88,7 +89,6 @@ def verify_receipt(photo_file_id):
             return None
 
         text = result['candidates'][0]['content']['parts'][0]['text']
-        # تنظيف الرد
         text = text.strip().replace('```json', '').replace('```', '').strip()
         json_match = re.search(r'\{.*\}', text, re.DOTALL)
         if json_match:
@@ -192,8 +192,7 @@ def start(message):
         "📌 طريقة الاستخدام:\n"
         "1️⃣ اكتب اسم الطالب\n"
         "2️⃣ ابعت صورة الإيصال\n"
-        "3️⃣ ابعت المبلغ\n"
-        "4️⃣ ابعت نوع الدفع\n\n"
+        "3️⃣ ابعت نوع الدفع\n\n"
         "ابدأ بكتابة اسم الطالب 👇"
     )
 
@@ -201,17 +200,6 @@ def start(message):
 def handle_text(message):
     chat_id = message.chat.id
     text = message.text.strip()
-
-    if chat_id in user_states and user_states[chat_id].get('step') == 'waiting_amount':
-        try:
-            float(text.replace(',', ''))
-        except:
-            bot.reply_to(message, "⚠️ ادخل المبلغ كرقم فقط\nمثال: 1500")
-            return
-        user_states[chat_id]['amount'] = text
-        user_states[chat_id]['step'] = 'waiting_pay_type'
-        bot.reply_to(message, "💳 ادخل نوع الدفع:\nمثال: انستاباي / كاش / تحويل بنكي")
-        return
 
     if chat_id in user_states and user_states[chat_id].get('step') == 'waiting_pay_type':
         pay_type = text
@@ -274,7 +262,7 @@ def handle_photo(message):
         return
 
     if not result.get('is_receipt'):
-        bot.reply_to(message, f"❌ الصورة دي مش إيصال دفع\n{result.get('reason', '')}")
+        bot.reply_to(message, f"❌ الإيصال مرفوض\n{result.get('reason', 'الصورة مش إيصال دفع')}")
         return
 
     if not result.get('transfer_number_found'):
@@ -282,18 +270,25 @@ def handle_photo(message):
         return
 
     receipt_amount = result.get('amount')
+    if not receipt_amount or receipt_amount in ['null', 'None', '', 'المبلغ']:
+        bot.reply_to(message, "❌ مش قادر أقرأ المبلغ من الإيصال، ابعت إيصال أوضح")
+        return
+
     now = datetime.now()
     date = now.strftime('%Y-%m-%d')
-    if receipt_amount and check_duplicate_receipt(receipt_amount, date):
+    if check_duplicate_receipt(receipt_amount, date):
         bot.reply_to(message, "❌ الإيصال ده اتسجل قبل كده!")
         return
 
-    user_states[chat_id]['step'] = 'waiting_amount'
+    user_states[chat_id]['step'] = 'waiting_pay_type'
     user_states[chat_id]['photo'] = photo_file_id
-    user_states[chat_id]['receipt_amount'] = receipt_amount
+    user_states[chat_id]['amount'] = receipt_amount
 
-    amount_hint = f"\n💡 المبلغ في الإيصال: {receipt_amount} جنيه" if receipt_amount else ""
-    bot.reply_to(message, f"✅ الإيصال تمام!{amount_hint}\n\n💰 ادخل المبلغ المدفوع:\nمثال: 1500")
+    bot.reply_to(message,
+        f"✅ الإيصال تمام!\n\n"
+        f"💰 المبلغ: {receipt_amount} جنيه\n\n"
+        f"💳 ادخل نوع الدفع:\nانستاباي / كاش / تحويل بنكي"
+    )
 
 if __name__ == '__main__':
     logger.info("Bot started...")
