@@ -113,9 +113,13 @@ def allowed(message):
     return not ALLOWED_CHAT_IDS or str(message.chat.id) in ALLOWED_CHAT_IDS
 
 
-# ===================== Gemini =====================
+# ===================== Gemini والإيصالات =====================
+
+MAX_RECEIPT_AGE_DAYS = int(os.environ.get('MAX_RECEIPT_AGE_DAYS', '3'))
+
 
 def verify_receipt(photo_file_id):
+    """بيبعت صورة الإيصال لـ Gemini ويرجّع البيانات اللي قراها منها، أو None لو حصل خطأ."""
     try:
         file_info = bot.get_file(photo_file_id)
         file_path = file_info.file_path
@@ -130,21 +134,24 @@ def verify_receipt(photo_file_id):
         else:
             mime_type = 'image/jpeg'
 
-        prompt = f"""أنت مساعد للتحقق من إيصالات الدفع.
-افحص هذه الصورة وأجب بـ JSON فقط بهذا الشكل بدون أي نص إضافي ولا markdown:
-{{"is_receipt": true, "recipient_verified": true, "amount": "المبلغ بالأرقام فقط", "reason": ""}}
+        today, _ = now_cairo()
+        prompt = f"""أنت مراجع حسابات بتتحقق من إيصالات دفع إيجار. تاريخ النهارده {today} بتوقيت القاهرة.
+افحص الصورة وأجب بـ JSON فقط بالشكل ده:
+{{"is_receipt": true, "recipient_verified": true, "recipient_found": "", "amount": "", "date": "", "time": "", "reference": "", "payment_method": "", "reason": ""}}
 
-تحقق من:
-1. هل الصورة إيصال دفع حقيقي؟ مقبول: انستاباي، كاش، تحويل بنكي، SMS تحويل، صورة رسالة تحويل بنكي.
-2. تحقق من اسم المستلم - مقبول أي من التالي:
-   - رقم انستاباي: {TRANSFER_NUMBER}
-   - اسم عربي يحتوي على: {RECIPIENT_NAME_AR}
-   - اسم إنجليزي يبدأ بـ: y m a m (مع نجوم بين الحروف مثل: yousef m******* a** m***)
-   - إذا الاسم مخفي جزئياً بنجوم (*) تحقق أن أول حرف من كل جزء هو: y ثم m ثم a ثم m
-   - للكاش: recipient_verified = true تلقائياً
-3. اقرأ المبلغ بالأرقام فقط بدون كلمة جنيه أو EGP.
-
-إذا مش قادر تتحقق من أي معلومة اجعل is_receipt = false واكتب السبب في reason.
+1. is_receipt: true فقط لو الصورة إيصال أو رسالة تأكيد لعملية دفع تمت بنجاح (انستاباي، تحويل بنكي، محفظة، رسالة SMS من البنك، إيصال كاش مكتوب). false لو صورة عادية، أو طلب تحويل لسه ما تمش، أو عملية فاشلة أو مرفوضة.
+2. recipient_found: اكتب اسم أو رقم المستلم زي ما هو مكتوب في الإيصال بالظبط.
+   recipient_verified = true فقط لو المستلم واحد من دول:
+   - رقم الانستاباي أو الموبايل: {TRANSFER_NUMBER}
+   - اسم عربي فيه: {RECIPIENT_NAME_AR}
+   - اسم إنجليزي: {RECIPIENT_NAME_EN}، أو اسم مخفي جزئيا بنجوم وأول حرف من كل جزء بالترتيب y ثم m ثم a ثم m (مثال: yousef m******* a** m***)
+   لو المستلم مش ظاهر أو مختلف: recipient_verified = false. ماتخلطش بين المرسل والمستلم.
+3. amount: المبلغ المحول بالأرقام الإنجليزي فقط (مثال 1400)، من غير عملة ولا رسوم.
+4. date: تاريخ العملية بصيغة YYYY-MM-DD. الإيصالات المصرية بتكتب اليوم قبل الشهر (01/11/2026 يعني 1 نوفمبر 2026). لو مكتوب النهارده أو Today استخدم {today}. لو التاريخ مش ظاهر اكتب "".
+5. time: وقت العملية بصيغة HH:MM (24 ساعة) لو ظاهر، غير كده "".
+6. reference: رقم العملية أو Reference أو Transaction ID أو رقم المرجع زي ما هو مكتوب، غير كده "".
+7. payment_method: واحد من: انستا باي، تحويل بنكي، محفظة، كاش.
+8. reason: لو is_receipt أو recipient_verified = false اكتب السبب بالعربي في جملة قصيرة.
 أجب بـ JSON فقط."""
 
         response = requests.post(
@@ -160,6 +167,7 @@ def verify_receipt(photo_file_id):
                 "generationConfig": {
                     "temperature": 0,
                     "maxOutputTokens": 1000,
+                    "responseMimeType": "application/json",
                     "thinkingConfig": {"thinkingBudget": 0}
                 }
             },
@@ -174,7 +182,6 @@ def verify_receipt(photo_file_id):
             return None
 
         text = result['candidates'][0]['content']['parts'][0]['text']
-        text = text.strip().replace('```json', '').replace('```', '').strip()
         json_match = re.search(r'\{.*\}', text, re.DOTALL)
         if json_match:
             return json.loads(json_match.group())
@@ -182,6 +189,53 @@ def verify_receipt(photo_file_id):
     except Exception as e:
         logger.error(f"Error verifying receipt: {e}")
         return None
+
+
+def parse_receipt_date(s):
+    s = to_western_digits(s or '').strip()
+    for f in ('%Y-%m-%d', '%d/%m/%Y', '%d-%m-%Y', '%Y/%m/%d'):
+        try:
+            return datetime.strptime(s, f).date()
+        except ValueError:
+            pass
+    return None
+
+
+def norm_ref(s):
+    return re.sub(r'[\s\-#:]', '', to_western_digits(s or '')).upper()
+
+
+def check_receipt_rules(result):
+    """بيطبق شروط القبول. بيرجّع (رسالة رفض أو None, بيانات الإيصال)."""
+    if not result.get('is_receipt'):
+        return f"الصورة دي مش إيصال دفع مقبول.\n{result.get('reason') or ''}".strip(), None
+    if not result.get('recipient_verified'):
+        found = result.get('recipient_found') or 'مش ظاهر'
+        return f"المستلم في الإيصال مش صح.\nالمستلم المكتوب: {found}\nالمفروض يكون {RECIPIENT_NAME_AR} أو رقم {TRANSFER_NUMBER}", None
+
+    amount = to_number(result.get('amount'))
+    if not amount:
+        return "مش قادر أقرأ المبلغ من الإيصال، ابعت صورة أوضح.", None
+
+    rdate = parse_receipt_date(result.get('date'))
+    if not rdate:
+        return "تاريخ العملية مش واضح في الإيصال، ابعت صورة يظهر فيها التاريخ.", None
+    today = datetime.now(TZ).date()
+    age = (today - rdate).days
+    if age < 0:
+        return f"تاريخ الإيصال ({rdate}) بعد النهارده، راجع الإيصال.", None
+    if age > MAX_RECEIPT_AGE_DAYS:
+        return f"الإيصال قديم: تاريخه {rdate} (من {age} يوم). المقبول آخر {MAX_RECEIPT_AGE_DAYS} أيام بس.", None
+
+    rtime = (to_western_digits(result.get('time') or '').strip())[:5]
+    return None, {
+        'amount': amount,
+        'date': rdate.isoformat(),
+        'time': rtime,
+        'reference': (result.get('reference') or '').strip(),
+        'recipient': (result.get('recipient_found') or '').strip(),
+        'method': normalize_method(result.get('payment_method') or ''),
+    }
 
 
 # ===================== الطالبات =====================
@@ -230,13 +284,18 @@ def read_student_status(student):
             'remaining': to_number(row[2]), 'status': row[3]}
 
 
-def record_payment(student, amount, pay_type, date, time_str, note=''):
+def record_payment(student, amount, pay_type, date, time_str, receipt=None):
     """بيضيف سطر في سجل المدفوعات بس. المدفوع والمتبقي والحالة بتتحسب في الشيت بمعادلات."""
+    r = receipt or {}
     try:
         log_ws = get_sheet().worksheet(LOG_SHEET)
         log_ws.append_row(
             [date, time_str, student['name'], student['sheet'],
-             f"{student['apt']} - {student['room']}", amount, pay_type, 'تليجرام', note],
+             f"{student['apt']} - {student['room']}", amount, pay_type, 'تليجرام', r.get('note', ''),
+             "'" + r['reference'] if r.get('reference') else '',
+             "'" + r['date'] if r.get('date') else '',
+             "'" + r['time'] if r.get('time') else '',
+             "'" + r['photo_uid'] if r.get('photo_uid') else ''],
             value_input_option='USER_ENTERED', table_range='A1')
         return True
     except Exception as e:
@@ -253,12 +312,20 @@ def check_duplicate(student, date):
         return False
 
 
-def check_duplicate_receipt(amount, date):
-    try:
-        data = get_sheet().worksheet(LOG_SHEET).get_all_values()
-        return any(len(r) >= 6 and r[0] == date and to_number(r[5]) == amount for r in data[1:])
-    except Exception:
-        return False
+def find_duplicate_receipt(receipt):
+    """بيدوّر في السجل على نفس الإيصال: نفس رقم العملية، أو نفس الصورة، أو نفس المبلغ والتاريخ والوقت."""
+    data = get_sheet().worksheet(LOG_SHEET).get_all_values()
+    ref = norm_ref(receipt.get('reference'))
+    for r in data[1:]:
+        r = r + [''] * (13 - len(r))
+        if ref and norm_ref(r[9]) == ref:
+            return r
+        if receipt.get('photo_uid') and r[12] == receipt['photo_uid']:
+            return r
+        if (not ref and receipt.get('time') and r[10] == receipt['date'] and r[11] == receipt['time']
+                and to_number(r[5]) == receipt['amount']):
+            return r
+    return None
 
 
 # ===================== المصاريف =====================
@@ -449,7 +516,18 @@ def handle_text(message):
 
 def finish_payment(message, student, amount, pay_type, date, time_str):
     chat_id = message.chat.id
-    if record_payment(student, amount, pay_type, date, time_str):
+    receipt = user_states.get(chat_id, {}).get('receipt')
+    if receipt:
+        try:
+            dup = find_duplicate_receipt(receipt)
+        except Exception as e:
+            logger.error(f"Error checking duplicates: {e}")
+            dup = None
+        if dup:
+            bot.reply_to(message, f"❌ الإيصال ده اتسجل قبل كده لـ {dup[2]} يوم {dup[0]}. ماتسجلش.")
+            user_states.pop(chat_id, None)
+            return
+    if record_payment(student, amount, pay_type, date, time_str, receipt):
         try:
             st = read_student_status(student)
             status = f"📊 إجمالي المدفوع: {fmt(st['paid'])} من {fmt(st['due'])}\n📌 المتبقي: {fmt(st['remaining'])} | {st['status']}"
@@ -478,31 +556,35 @@ def handle_photo(message):
         return
 
     bot.reply_to(message, "⏳ بتحقق من الإيصال...")
-    photo_file_id = message.photo[-1].file_id
-    result = verify_receipt(photo_file_id)
-
+    photo = message.photo[-1]
+    result = verify_receipt(photo.file_id)
     if result is None:
         bot.reply_to(message, "⚠️ مقدرتش أتحقق من الإيصال، حاول تاني")
         return
-    if not result.get('is_receipt'):
-        bot.reply_to(message, f"❌ الإيصال مرفوض\n{result.get('reason', 'الصورة مش إيصال دفع')}")
-        return
-    if not result.get('recipient_verified'):
-        bot.reply_to(message, "❌ الإيصال مش بيحتوي على اسم أو رقم المستلم الصح")
-        return
 
-    amount = to_number(result.get('amount'))
-    if not amount:
-        bot.reply_to(message, "❌ مش قادر أقرأ المبلغ من الإيصال، ابعت إيصال أوضح")
+    error, receipt = check_receipt_rules(result)
+    if error:
+        bot.reply_to(message, f"❌ الإيصال مرفوض\n{error}")
         return
 
-    date, _ = now_cairo()
-    if check_duplicate_receipt(amount, date):
-        bot.reply_to(message, "⚠️ فيه دفعة بنفس المبلغ اتسجلت النهارده. لو الإيصال ده مختلف كمّل عادي، غير كده ابعت: الغاء")
+    receipt['photo_uid'] = photo.file_unique_id
+    try:
+        dup = find_duplicate_receipt(receipt)
+    except Exception as e:
+        logger.error(f"Error checking duplicates: {e}")
+        bot.reply_to(message, "⚠️ مقدرتش أراجع السجل، حاول تاني")
+        return
+    if dup:
+        bot.reply_to(message, f"❌ الإيصال مرفوض\nالإيصال ده اتسجل قبل كده لـ {dup[2]} يوم {dup[0]}.")
+        return
 
-    user_states[chat_id].update({'step': 'waiting_pay_type', 'photo': photo_file_id, 'amount': amount})
+    user_states[chat_id].update({'step': 'waiting_pay_type', 'amount': receipt['amount'], 'receipt': receipt})
+    details = (f"💰 المبلغ: {fmt(receipt['amount'])} جنيه\n"
+               f"📅 تاريخ العملية: {receipt['date']}" + (f" {receipt['time']}" if receipt['time'] else '') + "\n"
+               f"👤 المستلم: {receipt['recipient']}"
+               + (f"\n🔢 رقم العملية: {receipt['reference']}" if receipt['reference'] else ''))
     bot.reply_to(message,
-        f"✅ الإيصال تمام!\n\n💰 المبلغ: {fmt(amount)} جنيه\n\n💳 ادخل نوع الدفع:\nانستاباي / كاش / تحويل بنكي")
+        f"✅ الإيصال تمام!\n\n{details}\n\n💳 ادخل نوع الدفع:\nانستاباي / كاش / تحويل بنكي")
 
 
 if __name__ == '__main__':
