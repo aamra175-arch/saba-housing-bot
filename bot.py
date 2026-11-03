@@ -30,9 +30,18 @@ EXPENSES_LOG = 'سجل المصاريف'
 EXPENSE_CATEGORIES = ['كهرباء', 'مياه', 'غاز', 'إنترنت', 'صيانة وسباكة', 'نظافة', 'مرتبات ومشرفات',
                       'إيجار للمالك', 'عمولة سمسار', 'أثاث ومشتريات', 'نثريات', 'أخرى']
 
-RECIPIENT_NAME_AR = 'يوسف منصور'
-RECIPIENT_NAME_EN = 'yousef mansour'
-RECIPIENT_INITIALS = ['y', 'm', 'a', 'm']
+# المستلمين المقبولين في الإيصال: أي رقم من دول، أو أي اسم من دول
+ACCEPTED_NUMBERS = list(dict.fromkeys(
+    [TRANSFER_NUMBER, '01152596793', '01030004184']
+    + [n.strip() for n in os.environ.get('EXTRA_TRANSFER_NUMBERS', '').split(',') if n.strip()]))
+ACCEPTED_RECIPIENTS = [
+    # (الاسم بالعربي، الاسم بالإنجليزي وطرق كتابته، أول حرف من كل جزء للاسم المخفي بالنجوم، مثال للاسم المخفي)
+    ('يوسف منصور', 'Yousef Mansour', 'y m a m', 'yousef m******* a** m***'),
+    ('عبدالرحمن محمد ابوعمره محمود',
+     'Abdelrahman Mohamed Abouamra Mahmoud (أو Abdulrahman / Abdel Rahman ، Mohammed ، Abu Amra / Abo Amra)',
+     'a m a m', 'abdelrahman m****** a******* m******'),
+]
+RECIPIENT_NAME_AR = ' أو '.join(r[0] for r in ACCEPTED_RECIPIENTS)
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 _client = None
@@ -135,23 +144,34 @@ def verify_receipt(photo_file_id):
             mime_type = 'image/jpeg'
 
         today, _ = now_cairo()
+        numbers_text = '، '.join(ACCEPTED_NUMBERS)
+        names_text = '\n'.join(
+            f"   - اسم عربي فيه: {ar} ، أو بالإنجليزي: {en} (ومقبول الاسم المخفي جزئيا بنجوم لو أول حرف من كل جزء بالترتيب: {ini}، مثال: {masked})"
+            for ar, en, ini, masked in ACCEPTED_RECIPIENTS)
         prompt = f"""أنت مراجع حسابات بتتحقق من إيصالات دفع إيجار. تاريخ النهارده {today} بتوقيت القاهرة.
 افحص الصورة وأجب بـ JSON فقط بالشكل ده:
-{{"is_receipt": true, "recipient_verified": true, "recipient_found": "", "amount": "", "date": "", "time": "", "reference": "", "payment_method": "", "reason": ""}}
+{{"is_receipt": true, "recipient_verified": true, "recipient_found": "", "amount": "", "date": "", "time": "", "reference": "", "payment_method": "", "tampering_suspected": false, "tampering_reason": "", "reason": ""}}
 
 1. is_receipt: true فقط لو الصورة إيصال أو رسالة تأكيد لعملية دفع تمت بنجاح (انستاباي، تحويل بنكي، محفظة، رسالة SMS من البنك، إيصال كاش مكتوب). false لو صورة عادية، أو طلب تحويل لسه ما تمش، أو عملية فاشلة أو مرفوضة.
 2. recipient_found: اكتب اسم أو رقم المستلم زي ما هو مكتوب في الإيصال بالظبط.
    recipient_verified = true فقط لو المستلم واحد من دول:
-   - رقم الانستاباي أو الموبايل: {TRANSFER_NUMBER}
-   - اسم عربي فيه: {RECIPIENT_NAME_AR}
-   - اسم إنجليزي: {RECIPIENT_NAME_EN}، أو اسم مخفي جزئيا بنجوم وأول حرف من كل جزء بالترتيب y ثم m ثم a ثم m (مثال: yousef m******* a** m***)
+   - رقم انستاباي أو موبايل من دول: {numbers_text}
+{names_text}
    لو المستلم مش ظاهر أو مختلف: recipient_verified = false. ماتخلطش بين المرسل والمستلم.
 3. amount: المبلغ المحول بالأرقام الإنجليزي فقط (مثال 1400)، من غير عملة ولا رسوم.
 4. date: تاريخ العملية بصيغة YYYY-MM-DD. الإيصالات المصرية بتكتب اليوم قبل الشهر (01/11/2026 يعني 1 نوفمبر 2026). لو مكتوب النهارده أو Today استخدم {today}. لو التاريخ مش ظاهر اكتب "".
 5. time: وقت العملية بصيغة HH:MM (24 ساعة) لو ظاهر، غير كده "".
 6. reference: رقم العملية أو Reference أو Transaction ID أو رقم المرجع زي ما هو مكتوب، غير كده "".
 7. payment_method: واحد من: انستا باي، تحويل بنكي، محفظة، كاش.
-8. reason: لو is_receipt أو recipient_verified = false اكتب السبب بالعربي في جملة قصيرة.
+8. tampering_suspected: افحص الصورة كويس بحثا عن أي تعديل، سواء بالذكاء الاصطناعي أو ببرامج تعديل الصور أو بأي طريقة:
+   - خط أو حجم أو لون أو سُمك مختلف في المبلغ أو التاريخ أو الوقت أو الاسم أو الرقم عن باقي الإيصال.
+   - أرقام أو حروف مش على نفس السطر، أو المسافات بينها مش منتظمة.
+   - مناطق مغبّشة أو ممسوحة أو متلزقة، أو خلفية لونها مختلف حوالين نص معين.
+   - علامات توليد بالذكاء الاصطناعي: نص مشوّه أو مالوش معنى، تفاصيل غير منطقية، شعارات مش مظبوطة.
+   - تفاصيل متناقضة جوه الإيصال، زي تاريخ أو وقت مش راكب مع بعض، أو شكل التطبيق مش مطابق للأصلي.
+   - صورة متقصوصة بحيث تخبي بيانات أساسية.
+   اجعل tampering_suspected = true لو فيه علامة واضحة على التعديل، واكتب في tampering_reason إيه اللي لاحظته بالعربي. لو الإيصال طبيعي اجعلها false. ماتحكمش بالتعديل لمجرد إن الصورة مش واضحة أو مضغوطة.
+9. reason: لو is_receipt أو recipient_verified = false اكتب السبب بالعربي في جملة قصيرة.
 أجب بـ JSON فقط."""
 
         response = requests.post(
@@ -209,9 +229,13 @@ def check_receipt_rules(result):
     """بيطبق شروط القبول. بيرجّع (رسالة رفض أو None, بيانات الإيصال)."""
     if not result.get('is_receipt'):
         return f"الصورة دي مش إيصال دفع مقبول.\n{result.get('reason') or ''}".strip(), None
+    if result.get('tampering_suspected'):
+        why = result.get('tampering_reason') or ''
+        return f"الإيصال عليه علامات تعديل.\n{why}\nلو الإيصال سليم، راجعه يدوي وسجّله في الشيت.".strip(), None
     if not result.get('recipient_verified'):
         found = result.get('recipient_found') or 'مش ظاهر'
-        return f"المستلم في الإيصال مش صح.\nالمستلم المكتوب: {found}\nالمفروض يكون {RECIPIENT_NAME_AR} أو رقم {TRANSFER_NUMBER}", None
+        return (f"المستلم في الإيصال مش صح.\nالمستلم المكتوب: {found}\n"
+                f"المفروض يكون {RECIPIENT_NAME_AR}\nأو رقم من دول: {'، '.join(ACCEPTED_NUMBERS)}"), None
 
     amount = to_number(result.get('amount'))
     if not amount:
