@@ -242,23 +242,27 @@ def check_receipt_rules(result):
         return "مش قادر أقرأ المبلغ من الإيصال، ابعت صورة أوضح.", None
 
     rdate = parse_receipt_date(result.get('date'))
-    if not rdate:
-        return "تاريخ العملية مش واضح في الإيصال، ابعت صورة يظهر فيها التاريخ.", None
-    today = datetime.now(TZ).date()
-    age = (today - rdate).days
-    if age < 0:
-        return f"تاريخ الإيصال ({rdate}) بعد النهارده، راجع الإيصال.", None
-    if age > MAX_RECEIPT_AGE_DAYS:
-        return f"الإيصال قديم: تاريخه {rdate} (من {age} يوم). المقبول آخر {MAX_RECEIPT_AGE_DAYS} أيام بس.", None
+    note = ''
+    if rdate:
+        today = datetime.now(TZ).date()
+        age = (today - rdate).days
+        if age < 0:
+            return f"تاريخ الإيصال ({rdate}) بعد النهارده، راجع الإيصال.", None
+        if age > MAX_RECEIPT_AGE_DAYS:
+            return f"الإيصال قديم: تاريخه {rdate} (من {age} يوم). المقبول آخر {MAX_RECEIPT_AGE_DAYS} أيام بس.", None
+    else:
+        # الإيصال من غير تاريخ: بيتقبل، وبيتكتب في الملاحظات علشان يتراجع
+        note = 'الإيصال من غير تاريخ'
 
     rtime = (to_western_digits(result.get('time') or '').strip())[:5]
     return None, {
         'amount': amount,
-        'date': rdate.isoformat(),
+        'date': rdate.isoformat() if rdate else '',
         'time': rtime,
         'reference': (result.get('reference') or '').strip(),
         'recipient': (result.get('recipient_found') or '').strip(),
         'method': normalize_method(result.get('payment_method') or ''),
+        'note': note,
     }
 
 
@@ -346,7 +350,7 @@ def find_duplicate_receipt(receipt):
             return r
         if receipt.get('photo_uid') and r[12] == receipt['photo_uid']:
             return r
-        if (not ref and receipt.get('time') and r[10] == receipt['date'] and r[11] == receipt['time']
+        if (not ref and receipt.get('date') and receipt.get('time') and r[10] == receipt['date'] and r[11] == receipt['time']
                 and to_number(r[5]) == receipt['amount']):
             return r
     return None
@@ -604,7 +608,8 @@ def handle_photo(message):
 
     user_states[chat_id].update({'step': 'waiting_pay_type', 'amount': receipt['amount'], 'receipt': receipt})
     details = (f"💰 المبلغ: {fmt(receipt['amount'])} جنيه\n"
-               f"📅 تاريخ العملية: {receipt['date']}" + (f" {receipt['time']}" if receipt['time'] else '') + "\n"
+               f"📅 تاريخ العملية: {receipt['date'] or 'مش مكتوب في الإيصال (هيتكتب في الملاحظات)'}"
+               + (f" {receipt['time']}" if receipt['time'] else '') + "\n"
                f"👤 المستلم: {receipt['recipient']}"
                + (f"\n🔢 رقم العملية: {receipt['reference']}" if receipt['reference'] else ''))
     bot.reply_to(message,
