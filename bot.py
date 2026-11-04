@@ -9,6 +9,7 @@ from google.oauth2.service_account import Credentials
 import requests
 import json
 import base64
+import time
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -20,6 +21,8 @@ TRANSFER_NUMBER = os.environ.get('TRANSFER_NUMBER', '01152596770')
 GOOGLE_CREDENTIALS = os.environ.get('GOOGLE_CREDENTIALS')
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-3.6-flash')
+# موديل احتياطي لو الأساسي زحمة (503) بعد كذا محاولة
+GEMINI_FALLBACK_MODEL = os.environ.get('GEMINI_FALLBACK_MODEL', 'gemini-2.5-flash')
 # اختياري: أرقام شات تليجرام المسموح لها، مفصولة بفاصلة. لو فاضي أي حد يقدر يستخدم البوت
 ALLOWED_CHAT_IDS = {s.strip() for s in os.environ.get('ALLOWED_CHAT_IDS', '').split(',') if s.strip()}
 
@@ -159,7 +162,7 @@ def verify_receipt(photo_file_id):
 {names_text}
    لو المستلم مش ظاهر أو مختلف: recipient_verified = false. ماتخلطش بين المرسل والمستلم.
 3. amount: المبلغ المحول بالأرقام الإنجليزي فقط (مثال 1400)، من غير عملة ولا رسوم.
-4. date: تاريخ العملية بصيغة YYYY-MM-DD. الإيصالات المصرية بتكتب اليوم قبل الشهر (01/11/2026 يعني 1 نوفمبر 2026). لو مكتوب النهارده أو Today استخدم {today}. لو التاريخ مش ظاهر اكتب "".
+4. date: تاريخ العملية بصيغة YYYY-MM-DD. الإيصالات المصرية بتكتب اليوم قبل الشهر (01/11/2026 يعني 1 نوفمبر 2026). لو مكتوب النهارده أو Today استخدم {today}. لو اليوم والشهر مكتوبين من غير سنة استخدم سنة النهارده. لو التاريخ مش ظاهر اكتب "".
 5. time: وقت العملية بصيغة HH:MM (24 ساعة) لو ظاهر، غير كده "".
 6. reference: رقم العملية أو Reference أو Transaction ID أو رقم المرجع زي ما هو مكتوب، غير كده "".
 7. payment_method: واحد من: انستا باي، تحويل بنكي، محفظة، كاش.
@@ -174,31 +177,45 @@ def verify_receipt(photo_file_id):
 9. reason: لو is_receipt أو recipient_verified = false اكتب السبب بالعربي في جملة قصيرة.
 أجب بـ JSON فقط."""
 
-        response = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}",
-            headers={"Content-Type": "application/json"},
-            json={
-                "contents": [{
-                    "parts": [
-                        {"inline_data": {"mime_type": mime_type, "data": img_base64}},
-                        {"text": prompt}
-                    ]
-                }],
-                "generationConfig": {
-                    "temperature": 0,
-                    "maxOutputTokens": 1000,
-                    "responseMimeType": "application/json",
-                    "thinkingConfig": {"thinkingBudget": 0}
-                }
-            },
-            timeout=60
-        )
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"inline_data": {"mime_type": mime_type, "data": img_base64}},
+                    {"text": prompt}
+                ]
+            }],
+            "generationConfig": {
+                "temperature": 0,
+                "maxOutputTokens": 1000,
+                "responseMimeType": "application/json",
+                "thinkingConfig": {"thinkingBudget": 0}
+            }
+        }
+        # Gemini ساعات بيرد 503 (زحمة) أو الاتصال بيتقطع: نحاول كذا مرة، وآخر محاولة بالموديل الاحتياطي
+        models = [GEMINI_MODEL, GEMINI_MODEL, GEMINI_MODEL]
+        if GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL != GEMINI_MODEL:
+            models.append(GEMINI_FALLBACK_MODEL)
+        result = None
+        for attempt, model in enumerate(models, start=1):
+            try:
+                response = requests.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}",
+                    headers={"Content-Type": "application/json"},
+                    json=payload,
+                    timeout=60
+                )
+                result = response.json()
+            except Exception as e:
+                logger.error(f"Gemini request failed (attempt {attempt}, {model}): {e}")
+                result = None
+            if result and 'candidates' in result:
+                break
+            logger.error(f"Gemini error (attempt {attempt}, {model}): {result}")
+            if attempt < len(models):
+                time.sleep(2 * attempt)
 
-        result = response.json()
         logger.info(f"Gemini response: {result}")
-
-        if 'candidates' not in result:
-            logger.error(f"Gemini error: {result}")
+        if not result or 'candidates' not in result:
             return None
 
         text = result['candidates'][0]['content']['parts'][0]['text']
@@ -246,6 +263,19 @@ def check_receipt_rules(result):
     if rdate:
         today = datetime.now(TZ).date()
         age = (today - rdate).days
+        if rdate.year != today.year and not (0 <= age <= MAX_RECEIPT_AGE_DAYS):
+            # Gemini ساعات بيقرا السنة غلط (مثلا 2020 بدل 2026). لو اليوم والشهر بسنة النهارده
+            # (أو السنة اللي فاتت في أول يناير) يطلعوا في المدة المسموحة، نعتبرها قراية غلط للسنة.
+            for y in (today.year, today.year - 1):
+                try:
+                    fixed = rdate.replace(year=y)
+                except ValueError:
+                    continue
+                if 0 <= (today - fixed).days <= MAX_RECEIPT_AGE_DAYS:
+                    note = f'سنة الإيصال اتقرت {rdate.year} واتعدلت لـ {y}'
+                    rdate = fixed
+                    age = (today - rdate).days
+                    break
         if age < 0:
             return f"تاريخ الإيصال ({rdate}) بعد النهارده، راجع الإيصال.", None
         if age > MAX_RECEIPT_AGE_DAYS:
@@ -587,7 +617,7 @@ def handle_photo(message):
     photo = message.photo[-1]
     result = verify_receipt(photo.file_id)
     if result is None:
-        bot.reply_to(message, "⚠️ مقدرتش أتحقق من الإيصال، حاول تاني")
+        bot.reply_to(message, "⚠️ خدمة قراءة الإيصالات مش بترد دلوقتي (غالبا زحمة). ابعت صورة الإيصال تاني بعد دقيقة.")
         return
 
     error, receipt = check_receipt_rules(result)
