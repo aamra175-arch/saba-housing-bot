@@ -22,7 +22,7 @@ GOOGLE_CREDENTIALS = os.environ.get('GOOGLE_CREDENTIALS')
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-3.6-flash')
 # موديل احتياطي لو الأساسي زحمة (503) بعد كذا محاولة
-GEMINI_FALLBACK_MODEL = os.environ.get('GEMINI_FALLBACK_MODEL', 'gemini-2.5-flash')
+GEMINI_FALLBACK_MODEL = os.environ.get('GEMINI_FALLBACK_MODEL', 'gemini-3.8-flash')
 # اختياري: أرقام شات تليجرام المسموح لها، مفصولة بفاصلة. لو فاضي أي حد يقدر يستخدم البوت
 ALLOWED_CHAT_IDS = {s.strip() for s in os.environ.get('ALLOWED_CHAT_IDS', '').split(',') if s.strip()}
 
@@ -191,32 +191,43 @@ def verify_receipt(photo_file_id):
                 "thinkingConfig": {"thinkingBudget": 0}
             }
         }
-        # Gemini ساعات بيرد 503 (زحمة) أو الاتصال بيتقطع: نحاول كذا مرة، وآخر محاولة بالموديل الاحتياطي
-        models = [GEMINI_MODEL, GEMINI_MODEL, GEMINI_MODEL]
+        # Gemini ساعات بيرد 503 (زحمة) أو الاتصال بيتقطع: نحاول كذا مرة بالموديل الأساسي.
+        # لو رد 429 (الحد اليومي خلص) أو 404 (الموديل مش متاح)، ننقل على طول للموديل الاحتياطي.
+        models = [GEMINI_MODEL]
         if GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL != GEMINI_MODEL:
             models.append(GEMINI_FALLBACK_MODEL)
         result = None
-        for attempt, model in enumerate(models, start=1):
-            try:
-                response = requests.post(
-                    f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}",
-                    headers={"Content-Type": "application/json"},
-                    json=payload,
-                    timeout=60
-                )
-                result = response.json()
-            except Exception as e:
-                logger.error(f"Gemini request failed (attempt {attempt}, {model}): {e}")
-                result = None
+        quota_hit = False
+        for model in models:
+            for attempt in range(1, 4):
+                try:
+                    response = requests.post(
+                        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}",
+                        headers={"Content-Type": "application/json"},
+                        json=payload,
+                        timeout=60
+                    )
+                    result = response.json()
+                except Exception as e:
+                    logger.error(f"Gemini request failed (attempt {attempt}, {model}): {e}")
+                    result = None
+                if result and 'candidates' in result:
+                    break
+                logger.error(f"Gemini error (attempt {attempt}, {model}): {result}")
+                code = (result or {}).get('error', {}).get('code') if isinstance(result, dict) else None
+                if code == 429:
+                    quota_hit = True
+                    break
+                if code in (400, 403, 404):
+                    break
+                if attempt < 3:
+                    time.sleep(2 * attempt)
             if result and 'candidates' in result:
                 break
-            logger.error(f"Gemini error (attempt {attempt}, {model}): {result}")
-            if attempt < len(models):
-                time.sleep(2 * attempt)
 
         logger.info(f"Gemini response: {result}")
         if not result or 'candidates' not in result:
-            return None
+            return {'_error': 'quota' if quota_hit else 'busy'}
 
         text = result['candidates'][0]['content']['parts'][0]['text']
         json_match = re.search(r'\{.*\}', text, re.DOTALL)
@@ -616,8 +627,11 @@ def handle_photo(message):
     bot.reply_to(message, "⏳ بتحقق من الإيصال...")
     photo = message.photo[-1]
     result = verify_receipt(photo.file_id)
-    if result is None:
+    if result is None or result.get('_error') == 'busy':
         bot.reply_to(message, "⚠️ خدمة قراءة الإيصالات مش بترد دلوقتي (غالبا زحمة). ابعت صورة الإيصال تاني بعد دقيقة.")
+        return
+    if result.get('_error') == 'quota':
+        bot.reply_to(message, "⚠️ الحد اليومي لقراءة الإيصالات خلص. سجّل الدفعة دي يدوي في الشيت، أو ابعت الإيصال بكره.")
         return
 
     error, receipt = check_receipt_rules(result)
