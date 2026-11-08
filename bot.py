@@ -20,6 +20,9 @@ EXPENSES_SHEET_ID = os.environ.get('EXPENSES_SHEET_ID')    # شيت المصار
 TRANSFER_NUMBER = os.environ.get('TRANSFER_NUMBER', '01152596770')
 GOOGLE_CREDENTIALS = os.environ.get('GOOGLE_CREDENTIALS')
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
+ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY')
+# موديل Claude: لو مش متحدد، البوت بيختار أحدث Sonnet متاح على الحساب
+CLAUDE_MODEL = os.environ.get('CLAUDE_MODEL', '')
 GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-3.6-flash')
 # موديل احتياطي لو الأساسي زحمة (503) بعد كذا محاولة
 GEMINI_FALLBACK_MODEL = os.environ.get('GEMINI_FALLBACK_MODEL', 'gemini-3.8-flash')
@@ -125,9 +128,132 @@ def allowed(message):
     return not ALLOWED_CHAT_IDS or str(message.chat.id) in ALLOWED_CHAT_IDS
 
 
-# ===================== Gemini والإيصالات =====================
+# ===================== قراءة الإيصالات (Claude، وGemini احتياطي) =====================
 
 MAX_RECEIPT_AGE_DAYS = int(os.environ.get('MAX_RECEIPT_AGE_DAYS', '3'))
+
+
+_claude_model_cache = None
+
+
+def pick_claude_model():
+    """بيرجّع موديل Claude: من CLAUDE_MODEL لو متحدد، وإلا أحدث Sonnet متاح على الحساب."""
+    global _claude_model_cache
+    if CLAUDE_MODEL:
+        return CLAUDE_MODEL
+    if _claude_model_cache:
+        return _claude_model_cache
+    r = requests.get('https://api.anthropic.com/v1/models?limit=100',
+                     headers={'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01'}, timeout=30)
+    data = r.json().get('data', [])
+    ids = [m.get('id', '') for m in data]
+    logger.info(f"Claude models available: {ids}")
+    for family in ('sonnet', 'opus', 'haiku'):
+        for mid in ids:
+            if family in mid:
+                _claude_model_cache = mid
+                return mid
+    if ids:
+        _claude_model_cache = ids[0]
+        return ids[0]
+    raise RuntimeError(f"No Claude models available: {r.text[:300]}")
+
+
+def call_claude(prompt, mime_type, img_base64):
+    """بيرجّع (النص، None) لو نجح، أو (None, 'quota'/'busy'/'nokey')."""
+    if not ANTHROPIC_API_KEY:
+        return None, 'nokey'
+    for attempt in range(1, 4):
+        try:
+            model = pick_claude_model()
+            r = requests.post(
+                'https://api.anthropic.com/v1/messages',
+                headers={'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01',
+                         'content-type': 'application/json'},
+                json={
+                    'model': model,
+                    'max_tokens': 1000,
+                    'temperature': 0,
+                    'messages': [{'role': 'user', 'content': [
+                        {'type': 'image', 'source': {'type': 'base64', 'media_type': mime_type, 'data': img_base64}},
+                        {'type': 'text', 'text': prompt},
+                    ]}],
+                },
+                timeout=90)
+            result = r.json()
+        except Exception as e:
+            logger.error(f"Claude request failed (attempt {attempt}): {e}")
+            result = None
+        if result and result.get('type') == 'message':
+            text = ''.join(b.get('text', '') for b in result.get('content', []) if b.get('type') == 'text')
+            logger.info(f"Claude response ({result.get('model')}): {text}")
+            return text, None
+        logger.error(f"Claude error (attempt {attempt}): {result}")
+        err = (result or {}).get('error', {}) if isinstance(result, dict) else {}
+        msg = str(err.get('message', '')).lower()
+        if 'credit' in msg or 'billing' in msg:
+            return None, 'quota'
+        if err.get('type') in ('authentication_error', 'permission_error', 'invalid_request_error', 'not_found_error'):
+            return None, 'busy'
+        if attempt < 3:
+            time.sleep(2 * attempt)
+    return None, 'busy'
+
+
+def call_gemini(prompt, mime_type, img_base64):
+    """بيرجّع (النص، None) لو نجح، أو (None, 'quota'/'busy')."""
+    payload = {
+        "contents": [{
+            "parts": [
+                {"inline_data": {"mime_type": mime_type, "data": img_base64}},
+                {"text": prompt}
+            ]
+        }],
+        "generationConfig": {
+            "temperature": 0,
+            "maxOutputTokens": 1000,
+            "responseMimeType": "application/json",
+            "thinkingConfig": {"thinkingBudget": 0}
+        }
+    }
+    # Gemini ساعات بيرد 503 (زحمة) أو الاتصال بيتقطع: نحاول كذا مرة بالموديل الأساسي.
+    # لو رد 429 (الحد اليومي خلص) أو 404 (الموديل مش متاح)، ننقل على طول للموديل الاحتياطي.
+    models = [GEMINI_MODEL]
+    if GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL != GEMINI_MODEL:
+        models.append(GEMINI_FALLBACK_MODEL)
+    result = None
+    quota_hit = False
+    for model in models:
+        for attempt in range(1, 4):
+            try:
+                response = requests.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}",
+                    headers={"Content-Type": "application/json"},
+                    json=payload,
+                    timeout=60
+                )
+                result = response.json()
+            except Exception as e:
+                logger.error(f"Gemini request failed (attempt {attempt}, {model}): {e}")
+                result = None
+            if result and 'candidates' in result:
+                break
+            logger.error(f"Gemini error (attempt {attempt}, {model}): {result}")
+            code = (result or {}).get('error', {}).get('code') if isinstance(result, dict) else None
+            if code == 429:
+                quota_hit = True
+                break
+            if code in (400, 403, 404):
+                break
+            if attempt < 3:
+                time.sleep(2 * attempt)
+        if result and 'candidates' in result:
+            break
+
+    logger.info(f"Gemini response: {result}")
+    if not result or 'candidates' not in result:
+        return None, ('quota' if quota_hit else 'busy')
+    return result['candidates'][0]['content']['parts'][0]['text'], None
 
 
 def verify_receipt(photo_file_id):
@@ -177,59 +303,15 @@ def verify_receipt(photo_file_id):
 9. reason: لو is_receipt أو recipient_verified = false اكتب السبب بالعربي في جملة قصيرة.
 أجب بـ JSON فقط."""
 
-        payload = {
-            "contents": [{
-                "parts": [
-                    {"inline_data": {"mime_type": mime_type, "data": img_base64}},
-                    {"text": prompt}
-                ]
-            }],
-            "generationConfig": {
-                "temperature": 0,
-                "maxOutputTokens": 1000,
-                "responseMimeType": "application/json",
-                "thinkingConfig": {"thinkingBudget": 0}
-            }
-        }
-        # Gemini ساعات بيرد 503 (زحمة) أو الاتصال بيتقطع: نحاول كذا مرة بالموديل الأساسي.
-        # لو رد 429 (الحد اليومي خلص) أو 404 (الموديل مش متاح)، ننقل على طول للموديل الاحتياطي.
-        models = [GEMINI_MODEL]
-        if GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL != GEMINI_MODEL:
-            models.append(GEMINI_FALLBACK_MODEL)
-        result = None
-        quota_hit = False
-        for model in models:
-            for attempt in range(1, 4):
-                try:
-                    response = requests.post(
-                        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}",
-                        headers={"Content-Type": "application/json"},
-                        json=payload,
-                        timeout=60
-                    )
-                    result = response.json()
-                except Exception as e:
-                    logger.error(f"Gemini request failed (attempt {attempt}, {model}): {e}")
-                    result = None
-                if result and 'candidates' in result:
-                    break
-                logger.error(f"Gemini error (attempt {attempt}, {model}): {result}")
-                code = (result or {}).get('error', {}).get('code') if isinstance(result, dict) else None
-                if code == 429:
-                    quota_hit = True
-                    break
-                if code in (400, 403, 404):
-                    break
-                if attempt < 3:
-                    time.sleep(2 * attempt)
-            if result and 'candidates' in result:
-                break
-
-        logger.info(f"Gemini response: {result}")
-        if not result or 'candidates' not in result:
-            return {'_error': 'quota' if quota_hit else 'busy'}
-
-        text = result['candidates'][0]['content']['parts'][0]['text']
+        # Claude هو الأساسي. لو فشل وفيه مفتاح Gemini، نجرب Gemini كاحتياطي.
+        text, err = call_claude(prompt, mime_type, img_base64)
+        if text is None and GEMINI_API_KEY:
+            logger.info(f"Claude failed ({err}), trying Gemini")
+            text, gerr = call_gemini(prompt, mime_type, img_base64)
+            if text is None:
+                err = 'quota' if 'quota' in (err, gerr) else 'busy'
+        if text is None:
+            return {'_error': 'quota' if err == 'quota' else 'busy'}
         json_match = re.search(r'\{.*\}', text, re.DOTALL)
         if json_match:
             return json.loads(json_match.group())
@@ -662,4 +744,11 @@ def handle_photo(message):
 
 if __name__ == '__main__':
     logger.info("Bot started...")
+    if ANTHROPIC_API_KEY:
+        try:
+            logger.info(f"Claude model for receipts: {pick_claude_model()}")
+        except Exception as e:
+            logger.error(f"Claude startup check failed: {e}")
+    else:
+        logger.error("ANTHROPIC_API_KEY is not set")
     bot.polling(none_stop=True)
