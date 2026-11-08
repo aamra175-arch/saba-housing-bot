@@ -23,7 +23,10 @@ GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY')
 # موديل Claude: لو مش متحدد، البوت بيختار أحدث Sonnet متاح على الحساب
 CLAUDE_MODEL = os.environ.get('CLAUDE_MODEL', '')
-# مين يقرا الإيصالات الأول: claude أو gemini. التاني بيبقى احتياطي.
+GROQ_API_KEY = os.environ.get('GROQ_API_KEY')
+# موديل Groq: لو مش متحدد، البوت بيختار موديل بيقرا صور من المتاح على الحساب
+GROQ_MODEL = os.environ.get('GROQ_MODEL', '')
+# مين يقرا الإيصالات الأول: groq أو gemini أو claude. الباقيين بيبقوا احتياطي.
 PRIMARY_AI = os.environ.get('PRIMARY_AI', 'claude').strip().lower()
 GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-3.6-flash')
 # موديل احتياطي لو الأساسي زحمة (503) بعد كذا محاولة
@@ -130,7 +133,7 @@ def allowed(message):
     return not ALLOWED_CHAT_IDS or str(message.chat.id) in ALLOWED_CHAT_IDS
 
 
-# ===================== قراءة الإيصالات (Claude، وGemini احتياطي) =====================
+# ===================== قراءة الإيصالات (Groq / Gemini / Claude) =====================
 
 MAX_RECEIPT_AGE_DAYS = int(os.environ.get('MAX_RECEIPT_AGE_DAYS', '3'))
 
@@ -200,6 +203,76 @@ def call_claude(prompt, mime_type, img_base64):
         if attempt < 3:
             time.sleep(2 * attempt)
     return None, 'busy'
+
+
+_groq_models_cache = None
+
+
+def groq_vision_models():
+    """الموديلات اللي هنجربها على Groq بالترتيب: GROQ_MODEL لو متحدد، وبعدها الموديلات اللي باين إنها بتقرا صور."""
+    global _groq_models_cache
+    if _groq_models_cache is None:
+        try:
+            r = requests.get('https://api.groq.com/openai/v1/models',
+                             headers={'Authorization': f'Bearer {GROQ_API_KEY}'}, timeout=30)
+            ids = [m.get('id', '') for m in r.json().get('data', []) if m.get('active', True)]
+        except Exception as e:
+            logger.error(f"Groq models list failed: {e}")
+            ids = []
+        logger.info(f"Groq models available: {ids}")
+        hints = ('vision', 'llama-4', 'scout', 'maverick', '-vl', 'vl-', 'qwen2.5-vl', 'gemma-3', 'pixtral', 'kimi')
+        vision = [m for m in ids if any(h in m.lower() for h in hints)]
+        # الأكبر غالبا أدق في القراية
+        vision.sort(key=lambda m: (('maverick' not in m), ('90b' not in m), m))
+        _groq_models_cache = vision
+    models = list(_groq_models_cache)
+    if GROQ_MODEL:
+        models = [GROQ_MODEL] + [m for m in models if m != GROQ_MODEL]
+    return models
+
+
+def call_groq(prompt, mime_type, img_base64):
+    """بيرجّع (النص، None) لو نجح، أو (None, 'quota'/'busy')."""
+    if not GROQ_API_KEY:
+        return None, 'nokey'
+    models = groq_vision_models()
+    if not models:
+        return None, 'busy'
+    quota_hit = False
+    for model in models[:4]:
+        for attempt in range(1, 3):
+            try:
+                r = requests.post(
+                    'https://api.groq.com/openai/v1/chat/completions',
+                    headers={'Authorization': f'Bearer {GROQ_API_KEY}', 'Content-Type': 'application/json'},
+                    json={
+                        'model': model,
+                        'temperature': 0,
+                        'max_tokens': 1000,
+                        'messages': [{'role': 'user', 'content': [
+                            {'type': 'text', 'text': prompt},
+                            {'type': 'image_url', 'image_url': {'url': f'data:{mime_type};base64,{img_base64}'}},
+                        ]}],
+                    },
+                    timeout=90)
+                result = r.json()
+            except Exception as e:
+                logger.error(f"Groq request failed (attempt {attempt}, {model}): {e}")
+                result = None
+            if result and result.get('choices'):
+                text = result['choices'][0].get('message', {}).get('content') or ''
+                logger.info(f"Groq response ({model}): {text}")
+                return text, None
+            logger.error(f"Groq error (attempt {attempt}, {model}): {result}")
+            err = (result or {}).get('error', {}) if isinstance(result, dict) else {}
+            code = str(err.get('code', '')) + ' ' + str(err.get('type', '')) + ' ' + str(err.get('message', '')).lower()
+            if 'rate_limit' in code or 'quota' in code or 'tokens per day' in code or 'requests per day' in code:
+                quota_hit = True
+                break
+            if result is not None:
+                break  # خطأ من الموديل نفسه (مثلا مابيقراش صور): نجرب الموديل اللي بعده
+            time.sleep(2)
+    return None, ('quota' if quota_hit else 'busy')
 
 
 def call_gemini(prompt, mime_type, img_base64):
@@ -305,10 +378,10 @@ def verify_receipt(photo_file_id):
 9. reason: لو is_receipt أو recipient_verified = false اكتب السبب بالعربي في جملة قصيرة.
 أجب بـ JSON فقط."""
 
-        # الأساسي حسب PRIMARY_AI (claude أو gemini)، ولو فشل نجرب التاني لو مفتاحه موجود.
-        providers = [('claude', call_claude, ANTHROPIC_API_KEY), ('gemini', call_gemini, GEMINI_API_KEY)]
-        if PRIMARY_AI == 'gemini':
-            providers.reverse()
+        # الأساسي حسب PRIMARY_AI، ولو فشل نجرب الباقيين اللي مفاتيحهم موجودة.
+        providers = [('groq', call_groq, GROQ_API_KEY), ('gemini', call_gemini, GEMINI_API_KEY),
+                     ('claude', call_claude, ANTHROPIC_API_KEY)]
+        providers.sort(key=lambda p: p[0] != PRIMARY_AI)
         text, errors = None, []
         for name, fn, key in providers:
             if not key:
@@ -752,6 +825,9 @@ def handle_photo(message):
 
 if __name__ == '__main__':
     logger.info("Bot started...")
+    logger.info(f"Primary AI for receipts: {PRIMARY_AI}")
+    if GROQ_API_KEY:
+        logger.info(f"Groq vision models: {groq_vision_models()}")
     if ANTHROPIC_API_KEY:
         try:
             logger.info(f"Claude model for receipts: {pick_claude_model()}")
