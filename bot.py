@@ -23,6 +23,8 @@ GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY')
 # موديل Claude: لو مش متحدد، البوت بيختار أحدث Sonnet متاح على الحساب
 CLAUDE_MODEL = os.environ.get('CLAUDE_MODEL', '')
+# مين يقرا الإيصالات الأول: claude أو gemini. التاني بيبقى احتياطي.
+PRIMARY_AI = os.environ.get('PRIMARY_AI', 'claude').strip().lower()
 GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-3.6-flash')
 # موديل احتياطي لو الأساسي زحمة (503) بعد كذا محاولة
 GEMINI_FALLBACK_MODEL = os.environ.get('GEMINI_FALLBACK_MODEL', 'gemini-3.8-flash')
@@ -303,15 +305,21 @@ def verify_receipt(photo_file_id):
 9. reason: لو is_receipt أو recipient_verified = false اكتب السبب بالعربي في جملة قصيرة.
 أجب بـ JSON فقط."""
 
-        # Claude هو الأساسي. لو فشل وفيه مفتاح Gemini، نجرب Gemini كاحتياطي.
-        text, err = call_claude(prompt, mime_type, img_base64)
-        if text is None and GEMINI_API_KEY:
-            logger.info(f"Claude failed ({err}), trying Gemini")
-            text, gerr = call_gemini(prompt, mime_type, img_base64)
-            if text is None:
-                err = 'quota' if 'quota' in (err, gerr) else 'busy'
+        # الأساسي حسب PRIMARY_AI (claude أو gemini)، ولو فشل نجرب التاني لو مفتاحه موجود.
+        providers = [('claude', call_claude, ANTHROPIC_API_KEY), ('gemini', call_gemini, GEMINI_API_KEY)]
+        if PRIMARY_AI == 'gemini':
+            providers.reverse()
+        text, errors = None, []
+        for name, fn, key in providers:
+            if not key:
+                continue
+            text, err = fn(prompt, mime_type, img_base64)
+            if text is not None:
+                break
+            logger.info(f"{name} failed ({err})")
+            errors.append(err)
         if text is None:
-            return {'_error': 'quota' if err == 'quota' else 'busy'}
+            return {'_error': 'quota' if 'quota' in errors else 'busy'}
         json_match = re.search(r'\{.*\}', text, re.DOTALL)
         if json_match:
             return json.loads(json_match.group())
