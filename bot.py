@@ -536,7 +536,7 @@ def record_payment(student, amount, pay_type, date, time_str, receipt=None):
             [date, time_str, student['name'], student['sheet'],
              f"{student['apt']} - {student['room']}", amount, pay_type, 'تليجرام', r.get('note', ''),
              "'" + r['reference'] if r.get('reference') else '',
-             "'" + r['date'] if r.get('date') else '',
+             ("'" + r['date']) if r.get('date') else ('من غير تاريخ' if r else ''),
              "'" + r['time'] if r.get('time') else '',
              "'" + r['photo_uid'] if r.get('photo_uid') else ''],
             value_input_option='USER_ENTERED', table_range='A1')
@@ -776,8 +776,10 @@ def finish_payment(message, student, amount, pay_type, date, time_str):
             status = f"📊 إجمالي المدفوع: {fmt(st['paid'])} من {fmt(st['due'])}\n📌 المتبقي: {fmt(st['remaining'])} | {st['status']}"
         except Exception:
             status = ''
+        no_date = (f"\n⚠️ الإيصال ده من غير تاريخ — اتكتب في الملاحظات علشان يتراجع"
+                   if receipt and not receipt.get('date') else '')
         bot.reply_to(message,
-            f"✅ تم تسجيل الدفع!\n\n"
+            f"✅ تم تسجيل الدفع!{no_date}\n\n"
             f"👤 {student['name']}\n"
             f"🏢 {student['sheet']} - {student['apt']}\n"
             f"💰 المدفوع: {fmt(amount)} جنيه\n"
@@ -825,8 +827,10 @@ def handle_photo(message):
         return
 
     user_states[chat_id].update({'step': 'waiting_pay_type', 'amount': receipt['amount'], 'receipt': receipt})
-    details = (f"💰 المبلغ: {fmt(receipt['amount'])} جنيه\n"
-               f"📅 تاريخ العملية: {receipt['date'] or 'مش مكتوب في الإيصال (هيتكتب في الملاحظات)'}"
+    details = (("⚠️ الإيصال ده من غير تاريخ — هيتقبل، بس هيتكتب في الملاحظات إنه من غير تاريخ\n\n"
+                if not receipt['date'] else '') +
+               f"💰 المبلغ: {fmt(receipt['amount'])} جنيه\n"
+               f"📅 تاريخ العملية: {receipt['date'] or 'مش مكتوب في الإيصال'}"
                + (f" {receipt['time']}" if receipt['time'] else '') + "\n"
                f"👤 المستلم: {receipt['recipient']}"
                + (f"\n🔢 رقم العملية: {receipt['reference']}" if receipt['reference'] else ''))
