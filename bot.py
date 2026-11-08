@@ -24,8 +24,8 @@ ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY')
 # موديل Claude: لو مش متحدد، البوت بيختار أحدث Sonnet متاح على الحساب
 CLAUDE_MODEL = os.environ.get('CLAUDE_MODEL', '')
 GROQ_API_KEY = os.environ.get('GROQ_API_KEY')
-# موديل Groq: لو مش متحدد، البوت بيختار موديل بيقرا صور من المتاح على الحساب
-GROQ_MODEL = os.environ.get('GROQ_MODEL', '')
+# موديل Groq اللي بيقرا صور (حسب docs/vision في Groq). لو مش متاح البوت بيدوّر على غيره.
+GROQ_MODEL = os.environ.get('GROQ_MODEL', 'qwen/qwen3.8-27b')
 # مين يقرا الإيصالات الأول: groq أو gemini أو claude. الباقيين بيبقوا احتياطي.
 PRIMARY_AI = os.environ.get('PRIMARY_AI', 'claude').strip().lower()
 GEMINI_MODEL = os.environ.get('GEMINI_MODEL', 'gemini-3.6-flash')
@@ -220,7 +220,7 @@ def groq_vision_models():
             logger.error(f"Groq models list failed: {e}")
             ids = []
         logger.info(f"Groq models available: {ids}")
-        hints = ('vision', 'llama-4', 'scout', 'maverick', '-vl', 'vl-', 'qwen2.5-vl', 'gemma-3', 'pixtral', 'kimi')
+        hints = ('vision', 'llama-4', 'scout', 'maverick', '-vl', 'vl-', 'qwen2.5-vl', 'qwen3.8', 'gemma-3', 'pixtral', 'kimi')
         vision = [m for m in ids if any(h in m.lower() for h in hints)]
         # الأكبر غالبا أدق في القراية
         vision.sort(key=lambda m: (('maverick' not in m), ('90b' not in m), m))
@@ -240,20 +240,25 @@ def call_groq(prompt, mime_type, img_base64):
         return None, 'busy'
     quota_hit = False
     for model in models[:4]:
-        for attempt in range(1, 3):
+        body = {
+            'model': model,
+            'temperature': 0,
+            'max_tokens': 1000,
+            'messages': [{'role': 'user', 'content': [
+                {'type': 'text', 'text': prompt},
+                {'type': 'image_url', 'image_url': {'url': f'data:{mime_type};base64,{img_base64}'}},
+            ]}],
+        }
+        if model.startswith('qwen/'):
+            # من غير تفكير (أسرع وبيوفر من الحد اليومي)، والرد JSON على طول
+            body['reasoning_effort'] = 'none'
+            body['response_format'] = {'type': 'json_object'}
+        for attempt in range(1, 4):
             try:
                 r = requests.post(
                     'https://api.groq.com/openai/v1/chat/completions',
                     headers={'Authorization': f'Bearer {GROQ_API_KEY}', 'Content-Type': 'application/json'},
-                    json={
-                        'model': model,
-                        'temperature': 0,
-                        'max_tokens': 1000,
-                        'messages': [{'role': 'user', 'content': [
-                            {'type': 'text', 'text': prompt},
-                            {'type': 'image_url', 'image_url': {'url': f'data:{mime_type};base64,{img_base64}'}},
-                        ]}],
-                    },
+                    json=body,
                     timeout=90)
                 result = r.json()
             except Exception as e:
@@ -267,6 +272,12 @@ def call_groq(prompt, mime_type, img_base64):
             err = (result or {}).get('error', {}) if isinstance(result, dict) else {}
             code = str(err.get('code', '')) + ' ' + str(err.get('type', '')) + ' ' + str(err.get('message', '')).lower()
             if 'rate_limit' in code or 'quota' in code or 'tokens per day' in code or 'requests per day' in code:
+                # لو حد الدقيقة: Groq بيقول "try again in Xs"، نستنى ونعيد بدل ما نعتبره خلص
+                wait = re.search(r'try again in (?:(\d+)m)?([\d.]+)s', code)
+                secs = (int(wait.group(1) or 0) * 60 + float(wait.group(2))) if wait else None
+                if secs is not None and secs <= 40 and 'per day' not in code and attempt < 3:
+                    time.sleep(secs + 1)
+                    continue
                 quota_hit = True
                 break
             if result is not None:
